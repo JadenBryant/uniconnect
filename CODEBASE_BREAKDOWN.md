@@ -280,3 +280,52 @@ Key EJS templates:
 2. Ensures visibility + not following self.
 3. Inserts or deletes row in `followers`.
 4. Responds with JSON or redirect.
+
+## Account creation
+1. User navigates to `/createAccount` — `routes/auth.js` renders `views/createAccount.ejs`.
+2. User submits the sign-up form (`POST /signup`) with `firstName`, `lastName`, `email`, `password`, `role`, and optional `schoolName`.
+3. `getRequestBody` normalizes and trims all fields; missing required fields (`firstName`, `email`, `password`) return a 400 error via `sendFailure`.
+4. `supabase.auth.signUp` is called with the credentials and user metadata (`first_name`, `last_name`, `role`, `school_name`) stored in Supabase auth.
+5. Supabase triggers a confirmation email; the user must click the link to activate the account.
+6. A database trigger (see `db/schema.sql`) automatically inserts a corresponding row into the `profiles` table, copying the metadata from auth into profile columns.
+7. On success, the handler redirects to `/login` (or returns `201 { ok: true }` for JSON clients).
+8. On first login, `middleware/auth.attachSessionUser` hydrates the session with the `profiles` row, resolving `role`, `schoolId`, profile media, and school branding for use across all templates.
+
+## Administrator dashboard
+1. Admin navigates to `/admin` → redirected to `/admin/dashboard` by `routes/admin.js`.
+2. `requireAuth` + `requireGlobalAdmin` (`lib/adminHelpers.js`) verify the session user has `role === 'admin'`; non-admins receive a 403.
+3. Four metrics are fetched in parallel:
+   - **Active users today** — paginates `supabase.auth.admin.listUsers` and counts users whose `last_sign_in_at` falls on today's date in the configured timezone.
+   - **Reports today** — counts rows in `post_reports` within the last 48-hour window that were created today.
+   - **Accounts under penalty** — counts distinct `user_id` values in `user_penalties` that have no expiry or a future expiry.
+   - **Flagged communities** — counts distinct `community_id` values in `community_reports` with `status = 'pending'`.
+4. `views/adminDashboard.ejs` renders the summary cards with these four figures.
+
+## Administrator user management
+1. Admin visits `/admin/users` (optionally with `?q=<search>`) — `routes/admin.js GET /users`.
+2. `fetchUsersBySearchQuery` searches `profiles` on `first_name`, `last_name`, and `email` (case-insensitive ILIKE) and returns up to 100 matches rendered in `views/adminUsers.ejs`.
+3. Admin clicks a user → `GET /admin/users/:id` loads the profile, school name, engagement metrics (posts, comments, communities, courses, reports filed, reports against, active penalties), and recent activity/admin-action logs via `fetchAdminUserDetail`, `fetchUserActivityLogsPage`, and `fetchRecentAdminActionsForUser`.
+4. **Update email** — `POST /admin/users/:id/update-email` validates the new address, calls `supabase.auth.admin.updateUserById` to update auth, syncs the `profiles` table, and logs a `user_email_updated` action in `admin_actions`.
+5. **Penalize user** — `POST /admin/users/:id/penalize` inserts a row into `user_penalties` with an optional `expires_at`, then logs a `user_penalty_added` action in `admin_actions`.
+6. All admin writes are recorded via `logAdminAction` (`lib/adminHelpers.js`) into the `admin_actions` table for audit.
+
+## Administrator school moderation
+1. Admin navigates to `/moderation` → redirected to `/moderation/school` by `routes/moderation.js`.
+2. Same `requireAuth` + `requireGlobalAdmin` guards apply.
+3. `GET /moderation/school` queries all rows from `schools` (ordered by name) and renders `views/schoolModeration.ejs` with name, domain, and logo URL for each school.
+4. **Create school** — `POST /moderation/school` normalizes the school name (max 160 chars), strips protocol/path/`www.` from the domain, and validates it against a hostname regex. An optional logo storage path is resolved to a public URL via `buildPublicStorageUrl`. The row is inserted into `schools`; a `school_created` admin action is logged.
+5. **Update school** — `POST /moderation/school/:id` performs the same validation and updates the existing row. A `school_updated` admin action is logged.
+6. `fetchSchoolColumnSet` introspects `information_schema.columns` at runtime to handle schema variations (e.g., `logo_url` vs `logo` vs `logo_path`).
+
+## Administrator report moderation
+1. Admin visits `/admin/reports` — `routes/admin.js GET /reports` calls `fetchReportsPageData`.
+2. Post reports, user reports, and community reports are fetched in parallel from `post_reports`, `user_reports`, and `community_reports` tables (most recent 100 each).
+3. Reporter/reported labels, post/comment author IDs, and community metadata are resolved and merged into a unified sorted list rendered in `views/reportDashboard.ejs`.
+4. Admin clicks a report → `GET /admin/reports/:type/:id` fetches the specific record with full context and renders `views/Report.ejs`.
+5. Admin submits a decision (`POST /admin/reports/:type/:id`):
+   - **Decision** must be `resolved` or `rejected`.
+   - Optional **moderation actions** (`penalize_user`, `remove_content`) are applied only when decision is `resolved`:
+     - `penalize_user` inserts into `user_penalties` and logs a `penalty_added_from_report` action.
+     - `remove_content` soft-deletes the relevant post/comment (post report), all posts and comments by the user (user report), or all posts and comments in the community (community report) by setting `is_deleted = true`.
+   - The report row's `status` and optional `admin_note` are updated in the appropriate table.
+   - A `report_moderated` action is logged in `admin_actions`.
